@@ -54,3 +54,13 @@ pub const THREAD_OVERRIDE: Option<usize> = None;
 
 /// Progress log interval per thread (every N salts checked).
 pub const PROGRESS_EVERY: u64 = 50_000;
+
+/// Global starting salt (offset) for the scan.
+/// Accepts decimal: "0", "123456789"
+/// or hex: "0x0000000000000000deadbeef"
+/*
+pub const START_SALT: &str = "4345600000";           // decimal
+// or
+pub const START_SALT: &str = "0x0000000103a1b2c3";   // hex (up to u128)
+*/
+pub const START_SALT: &str = "4363250000";

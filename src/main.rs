@@ -12,6 +12,7 @@ mod config;
 
 fn load_creation_code_hex<P: AsRef<Path>>(p: P) -> Vec<u8> {
     let raw = fs::read_to_string(p).expect("failed to read creation code file");
+    // Keep only hex characters; ignore 0x, quotes, commas, whitespace, etc.
     let filtered: String = raw.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if filtered.is_empty() {
         panic!("creation code file contained no hex");
@@ -59,7 +60,7 @@ fn validate_req(mode: config::MatchMode, req: &str) {
                 panic!("Mask mode requires a 40-char mask ('.' wildcards allowed)");
             }
         }
-        // Prefix/Suffix/Contains: any length 1..=40, no extra rules.
+        // Prefix/Suffix/Contains: any length 1..=40, no dots.
         _ => {
             if req.is_empty() || req.len() > 40 {
                 panic!("Pattern length must be between 1 and 40 nibbles");
@@ -89,12 +90,21 @@ fn address_matches(addr: Address, req: &str, mode: config::MatchMode) -> bool {
     }
 }
 
+fn parse_start_salt_u128(s: &str) -> u128 {
+    let t = s.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u128::from_str_radix(hex, 16).expect("START_SALT hex parse failed (u128 max)")
+    } else {
+        t.parse::<u128>().expect("START_SALT decimal parse failed")
+    }
+}
+
 fn main() {
     // --- Load config ---
     let deployer =
         Address::from_str(config::DEPLOYER).expect("invalid DEPLOYER in config.rs (address parse)");
     let init_code = load_creation_code_hex(config::CREATION_CODE_PATH);
-    let init_code_hash = keccak256(&init_code);      // <-- PRECOMPUTE ONCE
+    let init_code_hash = keccak256(&init_code);      // PRECOMPUTE ONCE
     let init_code_hash = Arc::new(init_code_hash);   // share to threads cheaply
 
     let raw_req = config::REQUEST_PATTERN;
@@ -109,17 +119,29 @@ fn main() {
         .map(|n| n.get())
         .unwrap_or(4);
     let num_threads = config::THREAD_OVERRIDE.unwrap_or(default_threads);
-    let num_threads_u128 = num_threads as u128;
+    let stride: u128 = num_threads as u128;
+    let start_at: u128 = parse_start_salt_u128(config::START_SALT);
 
     let (tx, rx) = mpsc::channel::<(U256, Address)>();
 
     println!(
-        "CREATE2 vanity search\n- deployer: {}\n- init_code: {} bytes\n- mode: {:?}\n- request: {}\n- threads: {}",
+        "CREATE2 vanity search\
+        \n- deployer: {}\
+        \n- init_code: {} bytes\
+        \n- init_code keccak256: 0x{}\
+        \n- mode: {:?}\
+        \n- request: {}\
+        \n- threads: {}\
+        \n- start_salt(dec): {}\
+        \n- start_salt(hex32): 0x{:064x}",
         deployer,
         init_code.len(),
+        hex::encode(init_code_hash.as_slice()),   // ← fixed
         mode,
         raw_req,
-        num_threads
+        num_threads,
+        start_at,
+        U256::from(start_at),
     );
 
     let start = Instant::now();
@@ -132,13 +154,13 @@ fn main() {
         thread::spawn(move || {
             let progress_every = config::PROGRESS_EVERY;
             let mut checked: u64 = 0;
-            let mut j: u128 = i as u128;
+            // start from offset + thread index
+            let mut j: u128 = start_at.wrapping_add(i as u128);
 
             loop {
                 let salt_u256 = U256::from(j);
                 let salt_b256 = B256::from(salt_u256);
 
-                // use precomputed hash
                 let addr = create2_address_from_hash(deployer, salt_b256, &init_code_hash);
 
                 if address_matches(addr, &req, mode) {
@@ -150,7 +172,7 @@ fn main() {
                     break;
                 }
 
-                j = j.wrapping_add(num_threads as u128);
+                j = j.wrapping_add(stride); // advance by #threads
                 checked = checked.wrapping_add(1);
                 if checked % progress_every == 0 {
                     eprintln!("thread {}: checked ~{} salts", i, checked);
@@ -159,6 +181,7 @@ fn main() {
         });
     }
 
+    // Wait for first hit, then print and exit.
     match rx.recv() {
         Ok((salt, addr)) => {
             let elapsed = start.elapsed().as_secs_f64();
