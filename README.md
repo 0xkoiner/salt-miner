@@ -173,3 +173,10 @@ Or with a quick script (Rust/JS/Foundry) using the same formula.
 The miner prehashes init code once; if you see slowness, you’re likely passing a non-hex file (placeholders) or not running --release.
 	•	Progress looks like it starts from zero.
 The thread i: checked ~N salts lines are per-thread counters. The absolute salt is START_SALT + i + N * num_threads.
+
+#### Contract Deployed wit Salt-Miner: 
+***pub const REQUEST_PATTERN: &str = "0x0000fee";***
+0x0000FEeaB9F73EAa49583aC15357a8673098D971
+
+***pub const REQUEST_PATTERN: &str = "0x0000256";***
+0x0000256A4eB4642E668CD371aeDE4b004295ad65

@@ -47,7 +47,7 @@ pub const MATCH_MODE: MatchMode = MatchMode::Prefix;
 ///   (Exact requires full 40 nibbles).
 /// - For Mask: provide a 40-char mask using [0-9a-f] and '.' wildcards,
 ///   e.g. "0x00007702................................"
-pub const REQUEST_PATTERN: &str = "0xfee43377702";
+pub const REQUEST_PATTERN: &str = "0x0000fee";
 
 /// Optional: set how many threads to use (None = use all logical CPUs).
 pub const THREAD_OVERRIDE: Option<usize> = None;
@@ -63,4 +63,4 @@ pub const START_SALT: &str = "4345600000";           // decimal
 // or
 pub const START_SALT: &str = "0x0000000103a1b2c3";   // hex (up to u128)
 */
-pub const START_SALT: &str = "4363250000";
+pub const START_SALT: &str = "0";
