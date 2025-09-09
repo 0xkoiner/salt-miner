@@ -43,9 +43,12 @@ If you know the exact INIT_CODE (creation code + ABI-encoded constructor args), 
 
 #### Contract Deployed wit Salt-Miner: 
 ***pub const REQUEST_PATTERN: &str = "0x0000fee";***
+<br></br>
 0x0000FEeaB9F73EAa49583aC15357a8673098D971
 
 ***pub const REQUEST_PATTERN: &str = "0x0000256";***
+<br></br>
+
 0x0000256A4eB4642E668CD371aeDE4b004295ad65
 
 ### Install & Run
