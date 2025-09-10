@@ -71,7 +71,8 @@ create2/
 └─ src/
    ├─ main.rs
    ├─ config.rs
-   └─ creation_code.hex        # your INIT_CODE (creationCode + constructor args)
+   ├─ shaders/create2_search.wgsl     # Bruteforce shader
+   └─ sample/creation_code.hex        # your INIT_CODE (creationCode + constructor args)
 ```
 
 ### Config (src/config.rs)
