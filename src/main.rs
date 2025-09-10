@@ -896,3 +896,82 @@ fn main() {
         Err(_) => eprintln!("all threads exited without a result (unexpected)"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    // This test requires a GPU device and driver that can run WGPU compute.
+    // Run with: cargo test -- --ignored
+    #[test]
+    #[ignore]
+    fn gpu_cpu_prefix_agree_on_chunk() {
+        // Deterministic test: empty prefix matches any address, single invocation, base=0.
+        // This guarantees the same salt (0) is used on GPU and CPU for comparison.
+        // Use empty prefix to ensure first salt always matches
+        let req = ""; // empty prefix => always matches
+        let mode = config::MatchMode::Prefix;
+
+        // Use configured deployer
+        let deployer = Address::from_str(config::DEPLOYER).expect("invalid DEPLOYER in config.rs");
+
+        // Tiny init code; we just need a deterministic keccak hash
+        let init_code: Vec<u8> = Vec::new();
+        let init_hash = keccak256(&init_code);
+
+        // Scan a single GPU invocation.
+        let base: u128 = 0;
+        // let work_items: u32 = 256 * 256; // 65,536 salts
+        let work_items: u32 = 1;
+
+        // Invoke the GPU chunk search and unwrap once
+        let (salt, addr) = gpu_try_prefix(req, mode, deployer, &init_hash, base, work_items)
+            .expect("No GPU match found in this chunk or GPU unavailable");
+
+        // Debug: check what the GPU inputs actually contain
+        let pattern_nibbles = vec![0u32; 40]; // empty prefix - no nibbles to match
+        let pattern_mask = vec![0u32; 40];
+
+        let inputs_u32 = build_inputs_u32(
+            base,
+            &pattern_nibbles,
+            &pattern_mask,
+            0u32, // pattern_len (empty prefix)
+            0u32, // match_mode (prefix)
+            1u32, // salts_per_invocation
+            1u32, // stride
+            1u32, // work_items
+            deployer,
+            &init_hash,
+        );
+
+        println!(
+            "GPU base_salt sent: [{}, {}, {}, {}]",
+            inputs_u32[0], inputs_u32[1], inputs_u32[2], inputs_u32[3]
+        );
+        println!(
+            "Expected salt to test: base({}) + gid.x(0) = {}",
+            base,
+            base + 0
+        );
+
+        // Recompute the same salt on CPU and compare
+        let expected_salt_to_test = U256::from(base + 0); // base + gid.x where gid.x=0
+        let cpu_addr =
+            create2_address_from_hash(deployer, B256::from(expected_salt_to_test), &init_hash);
+
+        println!("GPU returned salt: {}", salt);
+        println!("Expected salt: {}", expected_salt_to_test);
+        println!("GPU addr: 0x{}", hex::encode(addr));
+        println!("CPU addr: 0x{}", hex::encode(cpu_addr));
+        assert_eq!(
+            addr, cpu_addr,
+            "GPU and CPU addresses differ for the same salt"
+        );
+        assert!(
+            address_matches(addr, req, mode),
+            "GPU address does not satisfy the requested prefix"
+        );
+    }
+}
