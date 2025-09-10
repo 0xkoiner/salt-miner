@@ -50,7 +50,18 @@ pub const MATCH_MODE: MatchMode = MatchMode::Prefix;
 pub const REQUEST_PATTERN: &str = "0xcafecafe";
 
 /// Optional: set how many threads to use (None = use all logical CPUs).
-pub const THREAD_OVERRIDE: Option<usize> = Some(14);
+pub const THREAD_OVERRIDE: Option<usize> = None;
+
+/// GPU tuning (None = auto-tune based on adapter limits).
+/// - GPU_WORK_ITEMS_OVERRIDE: total invocations per dispatch (workgroups * workgroup_size),
+///   e.g. 1_048_576. If None, the program will auto-tune based on adapter limits.
+/// - GPU_SALTS_PER_INVOCATION_OVERRIDE: how many salts each thread tests in-shader (1, 8, 16, 32...).
+///   If None, the program will auto-tune a small integer based on device limits.
+/// - GPU_BATCH_DISPATCHES_OVERRIDE: number of dispatches to issue before mapping results.
+///   Higher values reduce CPU-GPU sync overhead (trade latency for throughput).
+pub const GPU_WORK_ITEMS_OVERRIDE: Option<u32> = None;
+pub const GPU_SALTS_PER_INVOCATION_OVERRIDE: Option<u32> = None;
+pub const GPU_BATCH_DISPATCHES_OVERRIDE: Option<u32> = None;
 
 /// Progress log interval per thread (every N salts checked).
 pub const PROGRESS_EVERY: u64 = 50_000;
