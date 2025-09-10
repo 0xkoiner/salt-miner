@@ -5,7 +5,7 @@ pub const DEPLOYER: &str = "0x4e59b44847b379578588920cA78FbF26c0B4956C";
 
 /// Path to a file that contains the creation/init code as hex text (no need for 0x).
 /// Any non-hex chars are ignored so comments/whitespace are fine.
-pub const CREATION_CODE_PATH: &str = "src/creation_code.rs";
+pub const CREATION_CODE_PATH: &str = "sample/creation_code.hex";
 
 /// How to interpret `REQUEST_PATTERN`.
 #[derive(Clone, Copy, Debug)]
