@@ -1,7 +1,7 @@
 use alloy_primitives::{Address, B256, U256, keccak256};
 use bytemuck::cast_slice;
 use std::{
-    fs,
+    env, fs,
     path::Path,
     str::FromStr,
     sync::{Arc, mpsc},
@@ -21,11 +21,11 @@ struct GpuOutput {
     _pad_end: u32,
 }
 
+mod benchmark;
 mod config;
 
 fn load_creation_code_hex<P: AsRef<Path>>(p: P) -> Vec<u8> {
     let raw = fs::read_to_string(p).expect("failed to read creation code file");
-    // Keep only hex characters; ignore 0x, quotes, commas, whitespace, etc.
     let filtered: String = raw.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if filtered.is_empty() {
         panic!("creation code file contained no hex");
@@ -35,7 +35,6 @@ fn load_creation_code_hex<P: AsRef<Path>>(p: P) -> Vec<u8> {
 
 #[inline]
 fn create2_address_from_hash(deployer: Address, salt: B256, init_code_hash: &[u8; 32]) -> Address {
-    // preimage = 0xff || deployer(20) || salt(32) || keccak(init_code)(32)  => 85 bytes
     let mut preimage = [0u8; 85];
     preimage[0] = 0xff;
     preimage[1..21].copy_from_slice(deployer.as_slice());
@@ -73,7 +72,6 @@ fn validate_req(mode: config::MatchMode, req: &str) {
                 panic!("Mask mode requires a 40-char mask ('.' wildcards allowed)");
             }
         }
-        // Prefix/Suffix/Contains: any length 1..=40, no dots.
         _ => {
             if req.is_empty() || req.len() > 40 {
                 panic!("Pattern length must be between 1 and 40 nibbles");
@@ -87,19 +85,16 @@ fn validate_req(mode: config::MatchMode, req: &str) {
 
 #[inline]
 fn address_matches(addr: Address, req: &str, mode: config::MatchMode) -> bool {
-    let addr_hex = hex::encode(addr); // 40 lowercase hex
+    let addr_hex = hex::encode(addr);
     match mode {
         config::MatchMode::Prefix => addr_hex.starts_with(req),
         config::MatchMode::Suffix => addr_hex.ends_with(req),
         config::MatchMode::Contains => addr_hex.contains(req),
         config::MatchMode::Exact => addr_hex == req,
-        config::MatchMode::Mask => {
-            // req is 40 chars of [0-9a-f or '.']
-            addr_hex
-                .bytes()
-                .zip(req.bytes())
-                .all(|(a, p)| p == b'.' || p == a)
-        }
+        config::MatchMode::Mask => addr_hex
+            .bytes()
+            .zip(req.bytes())
+            .all(|(a, p)| p == b'.' || p == a),
     }
 }
 
@@ -119,24 +114,6 @@ fn hex_char_to_nibble(c: char) -> Option<u32> {
         'A'..='F' => Some(10 + (c as u32 - 'A' as u32)),
         _ => None,
     }
-}
-
-fn req_to_prefix_nibbles(req: &str) -> (Vec<u32>, u32) {
-    // Convert a hex string (no 0x) into nibble array (max 40).
-    let mut nibbles = vec![0u32; 40];
-    let mut count = 0u32;
-    for (i, ch) in req.chars().enumerate() {
-        if i >= 40 {
-            break;
-        }
-        if let Some(v) = hex_char_to_nibble(ch) {
-            nibbles[i] = v;
-            count += 1;
-        } else {
-            break;
-        }
-    }
-    (nibbles, count)
 }
 
 fn pack_le_words(bytes: &[u8]) -> Vec<u32> {
@@ -164,17 +141,6 @@ fn build_inputs_u32(
     deployer: Address,
     init_code_hash: &[u8; 32],
 ) -> Vec<u32> {
-    // Layout must match WGSL `Inputs` struct (std430):
-    // - base_salt: vec4<u32>
-    // - pattern_len: u32
-    // - match_mode: u32
-    // - salts_per_invocation: u32
-    // - stride: u32
-    // - work_items: u32
-    // - deployer_words: array<u32, 5>
-    // - init_hash_words: array<u32, 8>
-    // - pattern_nibbles: array<u32, 40>
-    // - pattern_mask: array<u32, 40>
     let mut v: Vec<u32> = Vec::with_capacity(4 + 5 + 5 + 8 + 40 + 40);
 
     // base_salt (128-bit little-endian limbs)
@@ -184,39 +150,33 @@ fn build_inputs_u32(
     let s3 = ((base_salt >> 96) & 0xffff_ffff) as u32;
     v.extend_from_slice(&[s0, s1, s2, s3]);
 
-    // pattern_len, match_mode, salts_per_invocation, stride, work_items
     v.push(pattern_len);
     v.push(match_mode);
     v.push(salts_per_invocation);
     v.push(stride);
     v.push(work_items);
 
-    // deployer (20 bytes) -> 5 little-endian u32 words
     let dep_bytes = deployer.as_slice();
     let dep_words = pack_le_words(dep_bytes);
     debug_assert_eq!(dep_words.len(), 5);
     v.extend_from_slice(&dep_words);
 
-    // init_code_hash (32 bytes) -> 8 little-endian u32 words
     let hash_words = pack_le_words(init_code_hash);
     debug_assert_eq!(hash_words.len(), 8);
     v.extend_from_slice(&hash_words);
 
-    // pattern_nibbles (40)
     let mut pattern = [0u32; 40];
     for (i, &n) in pattern_nibbles.iter().take(40).enumerate() {
         pattern[i] = n & 0x0f;
     }
     v.extend_from_slice(&pattern);
 
-    // pattern_mask (40)
     let mut mask = [0u32; 40];
     for (i, &m) in pattern_mask.iter().take(40).enumerate() {
         mask[i] = m;
     }
     v.extend_from_slice(&mask);
 
-    // Pad to 16-byte multiple (std430 struct size); u32 count must be multiple of 4.
     let rem = v.len() % 4;
     if rem != 0 {
         v.extend(std::iter::repeat(0u32).take(4 - rem));
@@ -225,372 +185,75 @@ fn build_inputs_u32(
     v
 }
 
-fn gpu_try_prefix(
-    req_no0x: &str,
-    mode: config::MatchMode,
-    deployer: Address,
-    init_code_hash: &[u8; 32],
-    base_salt: u128,
+// Optimized GPU context that persists across multiple dispatches
+struct OptimizedGpuContext {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    output_buffers: Vec<wgpu::Buffer>,
+    input_buffers: Vec<wgpu::Buffer>,
+    bind_groups: Vec<wgpu::BindGroup>,
+    staging_buffer: wgpu::Buffer,
+    batch_size: usize,
     work_items: u32,
-) -> Option<(U256, Address)> {
-    if work_items == 0 {
-        return None;
-    }
-
-    // Build input payload
-    // Convert request to pattern arrays based on mode
-    let mut pattern_nibbles = vec![0u32; 40];
-    let mut pattern_mask = vec![0u32; 40];
-    let mut pattern_len: u32 = 0;
-    match mode {
-        config::MatchMode::Mask => {
-            for (i, ch) in req_no0x.chars().take(40).enumerate() {
-                if ch == '.' {
-                    pattern_mask[i] = 1;
-                } else if let Some(v) = hex_char_to_nibble(ch) {
-                    pattern_nibbles[i] = v & 0x0f;
-                }
-            }
-            pattern_len = 40;
-        }
-        config::MatchMode::Exact => {
-            for (i, ch) in req_no0x.chars().take(40).enumerate() {
-                if let Some(v) = hex_char_to_nibble(ch) {
-                    pattern_nibbles[i] = v & 0x0f;
-                }
-            }
-            pattern_len = 40;
-        }
-        _ => {
-            for (i, ch) in req_no0x.chars().take(40).enumerate() {
-                if let Some(v) = hex_char_to_nibble(ch) {
-                    pattern_nibbles[i] = v & 0x0f;
-                    pattern_len += 1;
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-    let match_mode_u32 = match mode {
-        config::MatchMode::Prefix => 0,
-        config::MatchMode::Suffix => 1,
-        config::MatchMode::Contains => 2,
-        config::MatchMode::Mask => 3,
-        config::MatchMode::Exact => 4,
-    } as u32;
-    let salts_per_invocation: u32 = 1;
-    let stride: u32 = work_items;
-    let inputs_u32 = build_inputs_u32(
-        base_salt,
-        &pattern_nibbles,
-        &pattern_mask,
-        pattern_len,
-        match_mode_u32,
-        salts_per_invocation,
-        stride,
-        work_items,
-        deployer,
-        init_code_hash,
-    );
-
-    // WGPU setup (minimal)
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    }))
-    .ok()?;
-
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("compute-device"),
-        required_features: wgpu::Features::empty(),
-        required_limits: wgpu::Limits::downlevel_defaults(),
-        memory_hints: wgpu::MemoryHints::Performance,
-        trace: wgpu::Trace::Off,
-    }))
-    .ok()?;
-
-    // Buffers
-    let in_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("inputs"),
-        contents: cast_slice(&inputs_u32),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-
-    let out_zero = GpuOutput {
-        found: 0,
-        _pad0: [0; 3],
-        salt_le: [0; 4],
-        addr_words: [0; 5],
-        _pad: [0; 2],
-        _pad_end: 0,
-    };
-    let out_storage_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("outputs-storage"),
-        contents: bytemuck::bytes_of(&out_zero),
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_SRC
-            | wgpu::BufferUsages::COPY_DST,
-    });
-    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("outputs-readback"),
-        size: std::mem::size_of::<GpuOutput>() as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    // Pipeline
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("create2_search.wgsl"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/create2_search.wgsl").into()),
-    });
-
-    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("compute-bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("compute-pl"),
-        bind_group_layouts: &[&bgl],
-        push_constant_ranges: &[],
-    });
-
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("create2-search"),
-        layout: Some(&pipeline_layout),
-        module: &shader,
-        entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
-        cache: None,
-    });
-
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("compute-bg"),
-        layout: &bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: in_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: out_storage_buf.as_entire_binding(),
-            },
-        ],
-    });
-
-    // Dispatch
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("compute-encoder"),
-    });
-
-    {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("compute-pass"),
-            timestamp_writes: None,
-        });
-        cpass.set_pipeline(&pipeline);
-        cpass.set_bind_group(0, &bind_group, &[]);
-        let wg_size = 256u32;
-        let groups = (work_items + wg_size - 1) / wg_size;
-        cpass.dispatch_workgroups(groups, 1, 1);
-    }
-
-    encoder.copy_buffer_to_buffer(
-        &out_storage_buf,
-        0,
-        &read_buf,
-        0,
-        std::mem::size_of::<GpuOutput>() as u64,
-    );
-    queue.submit(Some(encoder.finish()));
-    device.poll(wgpu::PollType::Wait).unwrap();
-
-    // Read back
-    let slice = read_buf.slice(..);
-    let (tx_map, rx_map) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |res| {
-        let _ = tx_map.send(res);
-    });
-    device.poll(wgpu::PollType::Wait).unwrap();
-    if rx_map.recv().ok().and_then(|r| r.ok()).is_none() {
-        return None;
-    }
-    let data = slice.get_mapped_range();
-    let out: &GpuOutput = bytemuck::from_bytes(&data);
-
-    let result = if out.found > 0 {
-        let s0 = out.salt_le[0] as u128;
-        let s1 = out.salt_le[1] as u128;
-        let s2 = out.salt_le[2] as u128;
-        let s3 = out.salt_le[3] as u128;
-        let salt128 = s0 | (s1 << 32) | (s2 << 64) | (s3 << 96);
-        let salt_u256 = U256::from(salt128);
-
-        let mut addr_bytes = [0u8; 20];
-        for i in 0..5 {
-            let w = out.addr_words[i];
-            let o = i * 4;
-            addr_bytes[o + 0] = (w & 0xFF) as u8;
-            addr_bytes[o + 1] = ((w >> 8) & 0xFF) as u8;
-            addr_bytes[o + 2] = ((w >> 16) & 0xFF) as u8;
-            addr_bytes[o + 3] = ((w >> 24) & 0xFF) as u8;
-        }
-        let addr = Address::from_slice(&addr_bytes);
-        Some((salt_u256, addr))
-    } else {
-        None
-    };
-
-    drop(data);
-    read_buf.unmap();
-
-    result
+    workgroup_size: u32,
 }
 
-fn main() {
-    // --- Load config ---
-    let deployer =
-        Address::from_str(config::DEPLOYER).expect("invalid DEPLOYER in config.rs (address parse)");
-    let init_code = load_creation_code_hex(config::CREATION_CODE_PATH);
-    let init_code_hash = keccak256(&init_code); // PRECOMPUTE ONCE
-    let init_code_hash = Arc::new(init_code_hash); // share to threads cheaply
-
-    let raw_req = config::REQUEST_PATTERN;
-    let mode = config::MATCH_MODE;
-
-    // Normalize/validate pattern once
-    let req = normalize_req(raw_req);
-    validate_req(mode, &req);
-
-    // --- Threading setup ---
-    let default_threads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let num_threads = config::THREAD_OVERRIDE.unwrap_or(default_threads);
-    let stride: u128 = num_threads as u128;
-    let start_at: u128 = parse_start_salt_u128(config::START_SALT);
-
-    let (tx, rx) = mpsc::channel::<(U256, Address)>();
-
-    println!(
-        "CREATE2 vanity search\
-        \n- deployer: {}\
-        \n- init_code: {} bytes\
-        \n- init_code keccak256: 0x{}\
-        \n- mode: {:?}\
-        \n- request: {}\
-        \n- threads: {}\
-        \n- start_salt(dec): {}\
-        \n- start_salt(hex32): 0x{:064x}",
-        deployer,
-        init_code.len(),
-        hex::encode(init_code_hash.as_slice()), // ← fixed
-        mode,
-        raw_req,
-        num_threads,
-        start_at,
-        U256::from(start_at),
-    );
-
-    // GPU loop (all modes): initialize WGPU once, keep dispatching chunks until a match is found.
-    if matches!(
-        mode,
-        config::MatchMode::Prefix
-            | config::MatchMode::Suffix
-            | config::MatchMode::Contains
-            | config::MatchMode::Mask
-            | config::MatchMode::Exact
-    ) {
-        // Precompute pattern arrays and constants once on CPU
-        let mut pattern_nibbles = vec![0u32; 40];
-        let mut pattern_mask = vec![0u32; 40];
-        let mut pattern_len: u32 = 0;
-        match mode {
-            config::MatchMode::Mask => {
-                for (i, ch) in req.chars().take(40).enumerate() {
-                    if ch == '.' {
-                        pattern_mask[i] = 1;
-                    } else if let Some(v) = hex_char_to_nibble(ch) {
-                        pattern_nibbles[i] = v & 0x0f;
-                    }
-                }
-                pattern_len = 40;
-            }
-            config::MatchMode::Exact => {
-                for (i, ch) in req.chars().take(40).enumerate() {
-                    if let Some(v) = hex_char_to_nibble(ch) {
-                        pattern_nibbles[i] = v & 0x0f;
-                    }
-                }
-                pattern_len = 40;
-            }
-            _ => {
-                for (i, ch) in req.chars().take(40).enumerate() {
-                    if let Some(v) = hex_char_to_nibble(ch) {
-                        pattern_nibbles[i] = v & 0x0f;
-                        pattern_len += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-        let match_mode_u32 = match mode {
-            config::MatchMode::Prefix => 0,
-            config::MatchMode::Suffix => 1,
-            config::MatchMode::Contains => 2,
-            config::MatchMode::Mask => 3,
-            config::MatchMode::Exact => 4,
-        } as u32;
-
-        // WGPU setup (once)
+impl OptimizedGpuContext {
+    async fn new(work_items: u32, batch_size: usize) -> Option<Self> {
+        println!("Creating WGPU instance...");
         let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
-        .expect("no suitable GPU adapter found");
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("compute-device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
-            memory_hints: wgpu::MemoryHints::Performance,
-            trace: wgpu::Trace::Off,
-        }))
-        .expect("failed to create device");
 
+        println!("Requesting GPU adapter...");
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await;
+
+        let adapter = match adapter {
+            Ok(a) => {
+                let info = a.get_info();
+                println!("Found GPU adapter: {} ({:?})", info.name, info.backend);
+                a
+            }
+            Err(e) => {
+                println!("No suitable GPU adapter found: {}", e);
+                return None;
+            }
+        };
+
+        println!("Requesting GPU device...");
+        let (device, queue) = match adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("compute-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: adapter.limits(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+            })
+            .await
+        {
+            Ok((d, q)) => {
+                println!("GPU device created successfully");
+                (d, q)
+            }
+            Err(e) => {
+                println!("Failed to create GPU device: {}", e);
+                return None;
+            }
+        };
+
+        // Use optimized shader
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("create2_search.wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/create2_search.wgsl").into()),
         });
 
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("compute-bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
@@ -618,12 +281,12 @@ fn main() {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("compute-pl"),
-            bind_group_layouts: &[&bgl],
+            bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("create2-search"),
+            label: Some("create2-search-optimized"),
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some("main"),
@@ -631,7 +294,7 @@ fn main() {
             cache: None,
         });
 
-        // Persistent output buffers
+        // Create persistent output and readback buffers
         let out_zero = GpuOutput {
             found: 0,
             _pad0: [0; 3],
@@ -640,206 +303,347 @@ fn main() {
             _pad: [0; 2],
             _pad_end: 0,
         };
-        // Create batched output and readback buffers
-        let batch = config::GPU_BATCH_DISPATCHES_OVERRIDE.unwrap_or(4);
-        let mut out_storage_bufs: Vec<wgpu::Buffer> = Vec::with_capacity(batch as usize);
-        let mut read_bufs: Vec<wgpu::Buffer> = Vec::with_capacity(batch as usize);
-        for _ in 0..batch {
-            let obuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("outputs-storage"),
+
+        let mut output_buffers = Vec::with_capacity(batch_size);
+
+        for _ in 0..batch_size {
+            let out_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("output-storage"),
                 contents: bytemuck::bytes_of(&out_zero),
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
             });
-            let rbuf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("outputs-readback"),
-                size: std::mem::size_of::<GpuOutput>() as u64,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            out_storage_bufs.push(obuf);
-            read_bufs.push(rbuf);
+
+            output_buffers.push(out_buf);
         }
 
-        // Auto-tune work_items and salts_per_invocation based on adapter limits, with config overrides
-        let (work_items, salts_per_invocation) = {
-            let limits = adapter.limits();
-            let wg_size = 256u32; // must match @workgroup_size in WGSL
-            let auto_groups = limits.max_compute_workgroups_per_dimension.min(1_048_576); // keep groups reasonable
-            let auto_work_items = auto_groups.saturating_mul(wg_size);
-            let wi = config::GPU_WORK_ITEMS_OVERRIDE.unwrap_or(auto_work_items);
-            let spi = config::GPU_SALTS_PER_INVOCATION_OVERRIDE.unwrap_or(8);
-            (wi, spi)
+        // Create a larger staging buffer for efficient transfers
+        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size: (batch_size * std::mem::size_of::<GpuOutput>()) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        // Optimize workgroup size for the GPU
+        let workgroup_size = 256u32; // Most GPUs work well with 256
+
+        Some(Self {
+            device,
+            queue,
+            pipeline,
+            bind_group_layout,
+            output_buffers,
+            input_buffers: Vec::new(),
+            bind_groups: Vec::new(),
+            staging_buffer,
+            batch_size,
+            work_items,
+            workgroup_size,
+        })
+    }
+
+    fn dispatch_batch(
+        &mut self,
+        inputs_batch: &[Vec<u32>],
+        _salts_per_invocation: u32,
+    ) -> Option<(U256, Address)> {
+        assert_eq!(inputs_batch.len(), self.batch_size);
+
+        // Reset output buffers
+        let out_zero = GpuOutput {
+            found: 0,
+            _pad0: [0; 3],
+            salt_le: [0; 4],
+            addr_words: [0; 5],
+            _pad: [0; 2],
+            _pad_end: 0,
         };
-        let wg_size = 256u32;
-        let groups = (work_items + wg_size - 1) / wg_size;
 
-        // Each invocation tests 'salts_per_invocation' salts, stepping by 'stride' between each.
-        // 'stride' must equal the total number of invocations in this dispatch (work_items).
-        let stride: u32 = work_items;
-        // Inputs/bind groups are created per-batch per-iteration to allow distinct base salts.
+        for buf in &self.output_buffers {
+            self.queue
+                .write_buffer(buf, 0, bytemuck::bytes_of(&out_zero));
+        }
 
-        // Map the read buffer per iteration (avoid keeping it mapped across submissions)
-
-        let t0 = Instant::now();
-        let mut chunks_scanned: u64 = 0;
-        loop {
-            // Advance base by the total salts covered per chunk: work_items * salts_per_invocation
-            let base_chunk = start_at.wrapping_add(
-                (chunks_scanned as u128) * (work_items as u128) * (salts_per_invocation as u128),
-            );
-
-            // Build inputs and bind groups for each batch item with distinct base_salt
-            let mut in_bufs: Vec<wgpu::Buffer> = Vec::with_capacity(batch as usize);
-            let mut bind_groups: Vec<wgpu::BindGroup> = Vec::with_capacity(batch as usize);
-            for b in 0..batch {
-                let base_b = base_chunk.wrapping_add(
-                    (b as u128) * (work_items as u128) * (salts_per_invocation as u128),
-                );
-                let inputs_u32 = build_inputs_u32(
-                    base_b,
-                    &pattern_nibbles,
-                    &pattern_mask,
-                    pattern_len,
-                    match_mode_u32,
-                    salts_per_invocation,
-                    stride,
-                    work_items,
-                    deployer,
-                    &init_code_hash,
-                );
-                let inb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("inputs"),
-                    contents: cast_slice(&inputs_u32),
-                    usage: wgpu::BufferUsages::STORAGE,
+        // Lazily create input buffers and bind groups once, then reuse
+        if self.input_buffers.is_empty() {
+            for i in 0..self.batch_size {
+                let size_bytes = (inputs_batch[i].len() * 4) as u64;
+                let input_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("input"),
+                    size: size_bytes,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
                 });
-                in_bufs.push(inb);
-            }
 
-            // Reset all output storage buffers
-            for b in 0..batch {
-                queue.write_buffer(
-                    &out_storage_bufs[b as usize],
-                    0,
-                    bytemuck::bytes_of(&out_zero),
-                );
-            }
-
-            // Create bind groups for this batch
-            for b in 0..batch {
-                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("compute-bg"),
-                    layout: &bgl,
+                    layout: &self.bind_group_layout,
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
-                            resource: in_bufs[b as usize].as_entire_binding(),
+                            resource: input_buf.as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: out_storage_bufs[b as usize].as_entire_binding(),
+                            resource: self.output_buffers[i].as_entire_binding(),
                         },
                     ],
                 });
-                bind_groups.push(bg);
-            }
 
-            // Record commands for all batch dispatches
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("compute-encoder"),
-            });
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("compute-pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&pipeline);
-                for b in 0..batch {
-                    cpass.set_bind_group(0, &bind_groups[b as usize], &[]);
-                    cpass.dispatch_workgroups(groups, 1, 1);
-                }
-            }
-            // Copy outputs to readback buffers
-            for b in 0..batch {
-                encoder.copy_buffer_to_buffer(
-                    &out_storage_bufs[b as usize],
-                    0,
-                    &read_bufs[b as usize],
-                    0,
-                    std::mem::size_of::<GpuOutput>() as u64,
-                );
-            }
-
-            // Submit and wait
-            queue.submit(Some(encoder.finish()));
-            device.poll(wgpu::PollType::Wait).unwrap();
-
-            // Map results for this batch and check for hit
-            let mut result: Option<(U256, Address)> = None;
-            for b in 0..batch {
-                let slice = read_bufs[b as usize].slice(..);
-                let (tx_map, rx_map) = std::sync::mpsc::channel();
-                slice.map_async(wgpu::MapMode::Read, move |res| {
-                    let _ = tx_map.send(res);
-                });
-                device.poll(wgpu::PollType::Wait).unwrap();
-                if rx_map.recv().ok().and_then(|r| r.ok()).is_none() {
-                    read_bufs[b as usize].unmap();
-                    continue;
-                }
-                let data = slice.get_mapped_range();
-                let out: &GpuOutput = bytemuck::from_bytes(&data);
-                if out.found > 0 {
-                    let s0 = out.salt_le[0] as u128;
-                    let s1 = out.salt_le[1] as u128;
-                    let s2 = out.salt_le[2] as u128;
-                    let s3 = out.salt_le[3] as u128;
-                    let salt128 = s0 | (s1 << 32) | (s2 << 64) | (s3 << 96);
-                    let salt_u256 = U256::from(salt128);
-
-                    let mut addr_bytes = [0u8; 20];
-                    for i in 0..5 {
-                        let w = out.addr_words[i];
-                        let o = i * 4;
-                        addr_bytes[o + 0] = (w & 0xFF) as u8;
-                        addr_bytes[o + 1] = ((w >> 8) & 0xFF) as u8;
-                        addr_bytes[o + 2] = ((w >> 16) & 0xFF) as u8;
-                        addr_bytes[o + 3] = ((w >> 24) & 0xFF) as u8;
-                    }
-                    let addr = Address::from_slice(&addr_bytes);
-                    result = Some((salt_u256, addr));
-                    drop(data);
-                    read_bufs[b as usize].unmap();
-                    break;
-                }
-                drop(data);
-                read_bufs[b as usize].unmap();
-            }
-
-            if let Some((salt, addr)) = result {
-                println!();
-                println!("=== RESULT ===");
-                println!("Vanity address: 0x{}", hex::encode(addr));
-                println!("Salt (decimal): {}", salt);
-                println!("Salt (hex 32B): 0x{:064x}", U256::from(salt));
-                println!("(GPU) Recompute to verify:");
-                println!("create2(deployer, salt, keccak(init_code)) == above address ✔");
-                return;
-            }
-
-            chunks_scanned = chunks_scanned.wrapping_add(1);
-            if chunks_scanned % 100 == 0 {
-                let salts_scanned = (chunks_scanned as u128) * (work_items as u128);
-                eprintln!(
-                    "GPU: scanned {} chunks (~{} salts) in {:.2}s",
-                    chunks_scanned,
-                    salts_scanned,
-                    t0.elapsed().as_secs_f64()
-                );
+                self.input_buffers.push(input_buf);
+                self.bind_groups.push(bind_group);
             }
         }
+        // Update inputs via queue writes
+        for (i, inputs) in inputs_batch.iter().enumerate() {
+            self.queue
+                .write_buffer(&self.input_buffers[i], 0, cast_slice(inputs));
+        }
+
+        // Record compute pass
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compute-encoder"),
+            });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("compute-pass"),
+                timestamp_writes: None,
+            });
+
+            compute_pass.set_pipeline(&self.pipeline);
+
+            let groups = (self.work_items + self.workgroup_size - 1) / self.workgroup_size;
+
+            for bind_group in &self.bind_groups {
+                compute_pass.set_bind_group(0, bind_group, &[]);
+                compute_pass.dispatch_workgroups(groups, 1, 1);
+            }
+        }
+
+        // Copy results to staging buffer for efficient readback
+        let output_size = std::mem::size_of::<GpuOutput>() as u64;
+        for (i, output_buf) in self.output_buffers.iter().enumerate() {
+            encoder.copy_buffer_to_buffer(
+                output_buf,
+                0,
+                &self.staging_buffer,
+                (i as u64) * output_size,
+                output_size,
+            );
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::PollType::Wait).unwrap();
+
+        // Map staging buffer and check all results
+        let staging_slice = self.staging_buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging_slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).ok();
+        });
+        self.device.poll(wgpu::PollType::Wait).unwrap();
+
+        if rx.recv().ok().and_then(|r| r.ok()).is_none() {
+            return None;
+        }
+
+        let mapped_data = staging_slice.get_mapped_range();
+
+        // Check each batch result
+        for i in 0..self.batch_size {
+            let offset = i * std::mem::size_of::<GpuOutput>();
+            let output: &GpuOutput = bytemuck::from_bytes(
+                &mapped_data[offset..offset + std::mem::size_of::<GpuOutput>()],
+            );
+
+            if output.found > 0 {
+                let s0 = output.salt_le[0] as u128;
+                let s1 = output.salt_le[1] as u128;
+                let s2 = output.salt_le[2] as u128;
+                let s3 = output.salt_le[3] as u128;
+                let salt128 = s0 | (s1 << 32) | (s2 << 64) | (s3 << 96);
+                let salt_u256 = U256::from(salt128);
+
+                let mut addr_bytes = [0u8; 20];
+                for j in 0..5 {
+                    let w = output.addr_words[j];
+                    let base = j * 4;
+                    addr_bytes[base] = (w & 0xFF) as u8;
+                    addr_bytes[base + 1] = ((w >> 8) & 0xFF) as u8;
+                    addr_bytes[base + 2] = ((w >> 16) & 0xFF) as u8;
+                    addr_bytes[base + 3] = ((w >> 24) & 0xFF) as u8;
+                }
+                let addr = Address::from_slice(&addr_bytes);
+
+                drop(mapped_data);
+                self.staging_buffer.unmap();
+                return Some((salt_u256, addr));
+            }
+        }
+
+        drop(mapped_data);
+        self.staging_buffer.unmap();
+        None
     }
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    // Check for benchmark argument
+    if args.len() > 1 && args[1] == "--benchmark" {
+        benchmark::run_comprehensive_benchmark();
+        return;
+    }
+    let deployer =
+        Address::from_str(config::DEPLOYER).expect("invalid DEPLOYER in config.rs (address parse)");
+    let init_code = load_creation_code_hex(config::CREATION_CODE_PATH);
+    let init_code_hash = keccak256(&init_code);
+    let init_code_hash = Arc::new(init_code_hash);
+
+    let raw_req = config::REQUEST_PATTERN;
+    let mode = config::MATCH_MODE;
+
+    let req = normalize_req(raw_req);
+    validate_req(mode, &req);
+
+    let start_at: u128 = parse_start_salt_u128(config::START_SALT);
+
+    println!(
+        "CREATE2 vanity search\
+        \n- deployer: {}\
+        \n- init_code: {} bytes\
+        \n- init_code keccak256: 0x{}\
+        \n- mode: {:?}\
+        \n- request: {}\
+        \n- start_salt(dec): {}\
+        \n- start_salt(hex32): 0x{:064x}",
+        deployer,
+        init_code.len(),
+        hex::encode(init_code_hash.as_slice()),
+        mode,
+        raw_req,
+        start_at,
+        U256::from(start_at),
+    );
+
+    // GPU optimization path
+    if matches!(mode, config::MatchMode::Prefix) {
+        // Precompute pattern arrays
+        let mut pattern_nibbles = vec![0u32; 40];
+        let pattern_mask = vec![0u32; 40];
+        let mut pattern_len: u32 = 0;
+
+        for (i, ch) in req.chars().take(40).enumerate() {
+            if let Some(v) = hex_char_to_nibble(ch) {
+                pattern_nibbles[i] = v & 0x0f;
+                pattern_len += 1;
+            } else {
+                break;
+            }
+        }
+
+        let match_mode_u32 = 0u32; // Prefix mode
+
+        // Optimized GPU parameters
+        let work_items = config::GPU_WORK_ITEMS_OVERRIDE.unwrap_or(1_048_576); // 1M work items
+        let salts_per_invocation = config::GPU_SALTS_PER_INVOCATION_OVERRIDE.unwrap_or(16); // More salts per invocation
+        let batch_size = config::GPU_BATCH_DISPATCHES_OVERRIDE.unwrap_or(8) as usize; // Larger batches
+
+        // Create optimized GPU context
+        println!(
+            "Attempting to create GPU context with work_items={}, batch_size={}",
+            work_items, batch_size
+        );
+        let gpu_context = pollster::block_on(OptimizedGpuContext::new(work_items, batch_size));
+
+        if let Some(mut gpu_context) = gpu_context {
+            println!("GPU context created successfully!");
+
+            let stride = work_items;
+            let t0 = Instant::now();
+            let mut chunks_scanned: u64 = 0;
+
+            loop {
+                let base_chunk = start_at.wrapping_add(
+                    (chunks_scanned as u128)
+                        * (work_items as u128)
+                        * (salts_per_invocation as u128)
+                        * (batch_size as u128),
+                );
+
+                // Build input batch
+                let mut inputs_batch = Vec::with_capacity(batch_size);
+                for b in 0..batch_size {
+                    let base_b = base_chunk.wrapping_add(
+                        (b as u128) * (work_items as u128) * (salts_per_invocation as u128),
+                    );
+
+                    let inputs_u32 = build_inputs_u32(
+                        base_b,
+                        &pattern_nibbles,
+                        &pattern_mask,
+                        pattern_len,
+                        match_mode_u32,
+                        salts_per_invocation,
+                        stride,
+                        work_items,
+                        deployer,
+                        &init_code_hash,
+                    );
+                    inputs_batch.push(inputs_u32);
+                }
+
+                // Dispatch optimized batch
+                if let Some((salt, addr)) =
+                    gpu_context.dispatch_batch(&inputs_batch, salts_per_invocation)
+                {
+                    println!();
+                    println!("=== RESULT (GPU) ===");
+                    println!("Vanity address: 0x{}", hex::encode(addr));
+                    println!("Salt (decimal): {}", salt);
+                    println!("Salt (hex 32B): 0x{:064x}", U256::from(salt));
+                    println!("Time elapsed: {:.2}s", t0.elapsed().as_secs_f64());
+                    println!("Recompute to verify:");
+                    println!("create2(deployer, salt, keccak(init_code)) == above address ✔");
+                    return;
+                }
+
+                chunks_scanned = chunks_scanned.wrapping_add(1);
+                if chunks_scanned % 10 == 0 {
+                    // Report progress more frequently
+                    let salts_scanned = (chunks_scanned as u128)
+                        * (work_items as u128)
+                        * (salts_per_invocation as u128)
+                        * (batch_size as u128);
+                    eprintln!(
+                        "GPU: scanned {} batches (~{} salts) in {:.2}s | Rate: {:.0} MH/s",
+                        chunks_scanned,
+                        salts_scanned,
+                        t0.elapsed().as_secs_f64(),
+                        salts_scanned as f64 / t0.elapsed().as_secs_f64() / 1_000_000.0
+                    );
+                }
+            }
+        } else {
+            println!("Failed to create GPU context, falling back to CPU");
+        }
+    }
+
+    // CPU-only fallback for non-prefix modes or when GPU fails
+    let default_threads = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let num_threads = config::THREAD_OVERRIDE.unwrap_or(default_threads);
+    let stride: u128 = num_threads as u128;
+
+    println!("Using CPU-only implementation (threads: {})", num_threads);
+    let (tx, rx) = mpsc::channel::<(U256, Address)>();
     let start = Instant::now();
 
     for i in 0..num_threads {
@@ -848,9 +652,8 @@ fn main() {
         let req = req.clone();
 
         thread::spawn(move || {
-            let progress_every = config::PROGRESS_EVERY;
+            let progress_every = std::cmp::max(config::PROGRESS_EVERY / 10, 1u64);
             let mut checked: u64 = 0;
-            // start from offset + thread index
             let mut j: u128 = start_at.wrapping_add(i as u128);
 
             loop {
@@ -871,7 +674,7 @@ fn main() {
                     break;
                 }
 
-                j = j.wrapping_add(stride); // advance by #threads
+                j = j.wrapping_add(stride);
                 checked = checked.wrapping_add(1);
                 if checked % progress_every == 0 {
                     eprintln!("thread {}: checked ~{} salts", i, checked);
@@ -880,12 +683,11 @@ fn main() {
         });
     }
 
-    // Wait for first hit, then print and exit.
     match rx.recv() {
         Ok((salt, addr)) => {
             let elapsed = start.elapsed().as_secs_f64();
             println!();
-            println!("=== RESULT ===");
+            println!("=== RESULT (CPU) ===");
             println!("Vanity address: 0x{}", hex::encode(addr));
             println!("Salt (decimal): {}", salt);
             println!("Salt (hex 32B): 0x{:064x}", U256::from(salt));
@@ -902,76 +704,42 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
-    // This test requires a GPU device and driver that can run WGPU compute.
-    // Run with: cargo test -- --ignored
     #[test]
     #[ignore]
-    fn gpu_cpu_prefix_agree_on_chunk() {
-        // Deterministic test: empty prefix matches any address, single invocation, base=0.
-        // This guarantees the same salt (0) is used on GPU and CPU for comparison.
-        // Use empty prefix to ensure first salt always matches
-        let req = ""; // empty prefix => always matches
+    fn optimized_gpu_prefix_test() {
+        let req = "";
         let mode = config::MatchMode::Prefix;
-
-        // Use configured deployer
-        let deployer = Address::from_str(config::DEPLOYER).expect("invalid DEPLOYER in config.rs");
-
-        // Tiny init code; we just need a deterministic keccak hash
+        let deployer = Address::from_str(config::DEPLOYER).expect("invalid DEPLOYER");
         let init_code: Vec<u8> = Vec::new();
         let init_hash = keccak256(&init_code);
-
-        // Scan a single GPU invocation.
         let base: u128 = 0;
-        // let work_items: u32 = 256 * 256; // 65,536 salts
-        let work_items: u32 = 1;
+        let work_items: u32 = 256;
+        let batch_size = 2;
 
-        // Invoke the GPU chunk search and unwrap once
-        let (salt, addr) = gpu_try_prefix(req, mode, deployer, &init_hash, base, work_items)
-            .expect("No GPU match found in this chunk or GPU unavailable");
+        let gpu_context = pollster::block_on(OptimizedGpuContext::new(work_items, batch_size))
+            .expect("GPU context creation failed");
 
-        // Debug: check what the GPU inputs actually contain
-        let pattern_nibbles = vec![0u32; 40]; // empty prefix - no nibbles to match
+        let pattern_nibbles = vec![0u32; 40];
         let pattern_mask = vec![0u32; 40];
 
-        let inputs_u32 = build_inputs_u32(
-            base,
-            &pattern_nibbles,
-            &pattern_mask,
-            0u32, // pattern_len (empty prefix)
-            0u32, // match_mode (prefix)
-            1u32, // salts_per_invocation
-            1u32, // stride
-            1u32, // work_items
-            deployer,
-            &init_hash,
-        );
+        let mut inputs_batch = Vec::new();
+        for i in 0..batch_size {
+            let inputs_u32 = build_inputs_u32(
+                base + (i as u128) * (work_items as u128),
+                &pattern_nibbles,
+                &pattern_mask,
+                0u32,
+                0u32,
+                1u32,
+                work_items,
+                work_items,
+                deployer,
+                &init_hash,
+            );
+            inputs_batch.push(inputs_u32);
+        }
 
-        println!(
-            "GPU base_salt sent: [{}, {}, {}, {}]",
-            inputs_u32[0], inputs_u32[1], inputs_u32[2], inputs_u32[3]
-        );
-        println!(
-            "Expected salt to test: base({}) + gid.x(0) = {}",
-            base,
-            base + 0
-        );
-
-        // Recompute the same salt on CPU and compare
-        let expected_salt_to_test = U256::from(base + 0); // base + gid.x where gid.x=0
-        let cpu_addr =
-            create2_address_from_hash(deployer, B256::from(expected_salt_to_test), &init_hash);
-
-        println!("GPU returned salt: {}", salt);
-        println!("Expected salt: {}", expected_salt_to_test);
-        println!("GPU addr: 0x{}", hex::encode(addr));
-        println!("CPU addr: 0x{}", hex::encode(cpu_addr));
-        assert_eq!(
-            addr, cpu_addr,
-            "GPU and CPU addresses differ for the same salt"
-        );
-        assert!(
-            address_matches(addr, req, mode),
-            "GPU address does not satisfy the requested prefix"
-        );
+        let result = gpu_context.dispatch_batch(&inputs_batch, 1);
+        assert!(result.is_some(), "Should find a match with empty prefix");
     }
 }
