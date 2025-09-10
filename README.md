@@ -44,16 +44,16 @@ If you know the exact INIT_CODE (creation code + ABI-encoded constructor args), 
 #### Contract Deployed wit Salt-Miner: 
 ***pub const REQUEST_PATTERN: &str = "0x0000fee";***
 
-0x0000FEeaB9F73EAa49583aC15357a8673098D971
+[0x0000FEeaB9F73EAa49583aC15357a8673098D971](https://sepolia.basescan.org/address/0x0000FEeaB9F73EAa49583aC15357a8673098D971)
 
 ***pub const REQUEST_PATTERN: &str = "0x0000256";***
 
-0x0000256A4eB4642E668CD371aeDE4b004295ad65
+[0x0000256A4eB4642E668CD371aeDE4b004295ad65](https://sepolia.basescan.org/address/0x0000FEeaB9F73EAa49583aC15357a8673098D971)
 
 ***pub const REQUEST_PATTERN: &str = "0x4337fee";***
 
 
-0x4337fee666646AdCbE048659dc573411070994B4
+[0x4337fee666646AdCbE048659dc573411070994B4](https://sepolia.basescan.org/address/0x4337fee666646AdCbE048659dc573411070994B4)
 
 ### Install & Run
 ```bash

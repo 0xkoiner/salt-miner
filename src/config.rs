@@ -50,7 +50,7 @@ pub const MATCH_MODE: MatchMode = MatchMode::Prefix;
 pub const REQUEST_PATTERN: &str = "0x00000000fee";
 
 /// Optional: set how many threads to use (None = use all logical CPUs).
-pub const THREAD_OVERRIDE: Option<usize> = None;
+pub const THREAD_OVERRIDE: Option<usize> = Some(14);
 
 /// Progress log interval per thread (every N salts checked).
 pub const PROGRESS_EVERY: u64 = 50_000;
