@@ -71,7 +71,8 @@ create2/
 └─ src/
    ├─ main.rs
    ├─ config.rs
-   └─ creation_code.hex        # your INIT_CODE (creationCode + constructor args)
+   ├─ shaders/create2_search.wgsl     # Bruteforce shader
+   └─ sample/creation_code.hex        # your INIT_CODE (creationCode + constructor args)
 ```
 
 ### Config (src/config.rs)
@@ -80,7 +81,7 @@ create2/
 pub const DEPLOYER: &str = "0x4e59b44847b379578588920cA78FbF26c0B4956C";
 
 /// Path to INIT_CODE hex file (no 0x; whitespace ok).
-pub const CREATION_CODE_PATH: &str = "src/creation_code.hex";
+pub const CREATION_CODE_PATH: &str = "sample/creation_code.hex";
 
 #[derive(Clone, Copy, Debug)]
 pub enum MatchMode { Prefix, Suffix, Contains, Mask, Exact }
