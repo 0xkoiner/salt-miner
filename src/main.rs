@@ -1,4 +1,5 @@
-use alloy_primitives::{keccak256, Address, B256, U256};
+use alloy_primitives::{Address, B256, U256};
+use sha3::{Digest, Keccak256};
 use std::{
     fs,
     path::Path,
@@ -9,6 +10,15 @@ use std::{
 };
 
 mod config;
+
+/// ARM-optimized Keccak256 using sha3 crate with assembly optimizations
+/// On M3 Pro, this uses ARM crypto extensions for faster hashing
+#[inline(always)]
+fn keccak256(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
 
 fn load_creation_code_hex<P: AsRef<Path>>(p: P) -> Vec<u8> {
     let raw = fs::read_to_string(p).expect("failed to read creation code file");
