@@ -297,28 +297,61 @@ fn main() {
             preimage[53..85].copy_from_slice(init_code_hash.as_slice());
             // preimage[21..53] will be updated with salt each iteration
 
+            // ⚡ PHASE 3: Batch processing - compute multiple addresses before checking
+            // This improves CPU pipeline utilization and reduces branch misprediction
+            const BATCH_SIZE: usize = 4;
+
             loop {
-                // ⚡ PHASE 2: Direct u128 → [u8; 32] conversion (no U256 intermediate)
-                let salt_bytes = u128_to_b256_bytes(j);
+                // ⚡ PHASE 3: Manually unrolled batch processing (4 salts at once)
+                // Compute all addresses first (better CPU instruction pipelining)
+                let salt0 = j;
+                let salt_bytes0 = u128_to_b256_bytes(salt0);
+                let addr0 = create2_address_optimized(&mut preimage, &salt_bytes0);
+                let j1 = j.wrapping_add(stride);
 
-                // ⚡ PHASE 2: Optimized CREATE2 with pre-allocated buffer
-                let addr = create2_address_optimized(&mut preimage, &salt_bytes);
+                let salt1 = j1;
+                let salt_bytes1 = u128_to_b256_bytes(salt1);
+                let addr1 = create2_address_optimized(&mut preimage, &salt_bytes1);
+                let j2 = j1.wrapping_add(stride);
 
-                // ⚡ PHASE 1: Zero-allocation byte-level matching
-                if address_matches_fast(&addr, &pattern) {
-                    eprintln!(
-                        "[FOUND] thread={} salt(dec)={} salt(hex)=0x{:064x} addr=0x{}",
-                        i, j, j, hex::encode(addr)
-                    );
-                    // Convert back to U256 for display
-                    let salt_u256 = U256::from(j);
-                    let _ = tx.send((salt_u256, addr));
-                    break;
+                let salt2 = j2;
+                let salt_bytes2 = u128_to_b256_bytes(salt2);
+                let addr2 = create2_address_optimized(&mut preimage, &salt_bytes2);
+                let j3 = j2.wrapping_add(stride);
+
+                let salt3 = j3;
+                let salt_bytes3 = u128_to_b256_bytes(salt3);
+                let addr3 = create2_address_optimized(&mut preimage, &salt_bytes3);
+                j = j3.wrapping_add(stride);
+
+                // ⚡ PHASE 3: Check all addresses (reduced branch overhead)
+                if address_matches_fast(&addr0, &pattern) {
+                    eprintln!("[FOUND] thread={} salt(dec)={} salt(hex)=0x{:064x} addr=0x{}",
+                              i, salt0, salt0, hex::encode(addr0));
+                    let _ = tx.send((U256::from(salt0), addr0));
+                    return;
+                }
+                if address_matches_fast(&addr1, &pattern) {
+                    eprintln!("[FOUND] thread={} salt(dec)={} salt(hex)=0x{:064x} addr=0x{}",
+                              i, salt1, salt1, hex::encode(addr1));
+                    let _ = tx.send((U256::from(salt1), addr1));
+                    return;
+                }
+                if address_matches_fast(&addr2, &pattern) {
+                    eprintln!("[FOUND] thread={} salt(dec)={} salt(hex)=0x{:064x} addr=0x{}",
+                              i, salt2, salt2, hex::encode(addr2));
+                    let _ = tx.send((U256::from(salt2), addr2));
+                    return;
+                }
+                if address_matches_fast(&addr3, &pattern) {
+                    eprintln!("[FOUND] thread={} salt(dec)={} salt(hex)=0x{:064x} addr=0x{}",
+                              i, salt3, salt3, hex::encode(addr3));
+                    let _ = tx.send((U256::from(salt3), addr3));
+                    return;
                 }
 
-                j = j.wrapping_add(stride); // advance by #threads
-                checked = checked.wrapping_add(1);
-                if checked % progress_every == 0 {
+                checked = checked.wrapping_add(BATCH_SIZE as u64);
+                if checked % progress_every < BATCH_SIZE as u64 {
                     eprintln!("thread {}: checked ~{} salts", i, checked);
                 }
             }
