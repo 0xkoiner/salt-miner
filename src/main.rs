@@ -41,6 +41,132 @@ fn normalize_req(s: &str) -> String {
     p
 }
 
+/// Parsed pattern for fast byte-level matching (zero allocations in hot path)
+#[derive(Clone, Debug)]
+struct ParsedPattern {
+    mode: config::MatchMode,
+    /// For string-based modes (backward compat)
+    hex_string: String,
+    /// For byte-optimized modes
+    bytes: Vec<u8>,
+    /// If pattern has odd number of nibbles, this is the last nibble (0x0-0xf)
+    partial_nibble: Option<u8>,
+}
+
+impl ParsedPattern {
+    fn from_hex_string(hex_str: &str, mode: config::MatchMode) -> Self {
+        let bytes_len = hex_str.len() / 2;
+        let has_partial = hex_str.len() % 2 == 1;
+
+        let mut bytes = Vec::with_capacity(bytes_len + if has_partial { 1 } else { 0 });
+
+        // Parse full bytes
+        for i in 0..bytes_len {
+            let byte_str = &hex_str[i * 2..i * 2 + 2];
+            bytes.push(u8::from_str_radix(byte_str, 16).unwrap());
+        }
+
+        // Parse partial nibble if exists (e.g., "0x00000000fee" -> last 'e')
+        let partial_nibble = if has_partial {
+            let last_nibble = hex_str.chars().last().unwrap();
+            Some(u8::from_str_radix(&last_nibble.to_string(), 16).unwrap())
+        } else {
+            None
+        };
+
+        Self {
+            mode,
+            hex_string: hex_str.to_string(),
+            bytes,
+            partial_nibble,
+        }
+    }
+}
+
+/// Fast byte-level address matching (NO string allocations)
+#[inline(always)]
+fn address_matches_fast(addr: &Address, pattern: &ParsedPattern) -> bool {
+    let addr_bytes = addr.as_slice(); // 20 bytes
+
+    match pattern.mode {
+        config::MatchMode::Prefix => {
+            // Check full bytes
+            if addr_bytes.len() < pattern.bytes.len() {
+                return false;
+            }
+
+            for i in 0..pattern.bytes.len() {
+                if addr_bytes[i] != pattern.bytes[i] {
+                    return false;
+                }
+            }
+
+            // Check partial nibble (high nibble of next byte)
+            if let Some(nibble) = pattern.partial_nibble {
+                if let Some(&next_byte) = addr_bytes.get(pattern.bytes.len()) {
+                    let high_nibble = next_byte >> 4;
+                    if high_nibble != nibble {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+
+            true
+        }
+        config::MatchMode::Suffix => {
+            // For suffix, we need to check the end
+            let start_idx = if let Some(_) = pattern.partial_nibble {
+                // With partial nibble, we need to check nibble alignment
+                // Fall back to string comparison for suffix with odd nibbles
+                return address_matches_string(addr, &pattern.hex_string, pattern.mode);
+            } else {
+                addr_bytes.len().saturating_sub(pattern.bytes.len())
+            };
+
+            if start_idx + pattern.bytes.len() > addr_bytes.len() {
+                return false;
+            }
+
+            &addr_bytes[start_idx..] == &pattern.bytes[..]
+        }
+        config::MatchMode::Contains => {
+            // For contains, fall back to string (but we could optimize with SIMD later)
+            address_matches_string(addr, &pattern.hex_string, pattern.mode)
+        }
+        config::MatchMode::Mask => {
+            // For mask, use string comparison (already efficient)
+            address_matches_string(addr, &pattern.hex_string, pattern.mode)
+        }
+        config::MatchMode::Exact => {
+            // Exact match: compare all 20 bytes
+            if pattern.bytes.len() != 20 {
+                return false;
+            }
+            addr_bytes == &pattern.bytes[..]
+        }
+    }
+}
+
+/// Original string-based matching (for modes that need it)
+#[inline]
+fn address_matches_string(addr: &Address, req: &str, mode: config::MatchMode) -> bool {
+    let addr_hex = hex::encode(addr); // 40 lowercase hex
+    match mode {
+        config::MatchMode::Prefix => addr_hex.starts_with(req),
+        config::MatchMode::Suffix => addr_hex.ends_with(req),
+        config::MatchMode::Contains => addr_hex.contains(req),
+        config::MatchMode::Exact => addr_hex == req,
+        config::MatchMode::Mask => {
+            addr_hex
+                .bytes()
+                .zip(req.bytes())
+                .all(|(a, p)| p == b'.' || p == a)
+        }
+    }
+}
+
 fn validate_req(mode: config::MatchMode, req: &str) {
     let ok_chars = req.chars().all(|c| c.is_ascii_hexdigit() || c == '.');
     if !ok_chars {
@@ -72,23 +198,6 @@ fn validate_req(mode: config::MatchMode, req: &str) {
     }
 }
 
-#[inline]
-fn address_matches(addr: Address, req: &str, mode: config::MatchMode) -> bool {
-    let addr_hex = hex::encode(addr); // 40 lowercase hex
-    match mode {
-        config::MatchMode::Prefix => addr_hex.starts_with(req),
-        config::MatchMode::Suffix => addr_hex.ends_with(req),
-        config::MatchMode::Contains => addr_hex.contains(req),
-        config::MatchMode::Exact => addr_hex == req,
-        config::MatchMode::Mask => {
-            // req is 40 chars of [0-9a-f or '.']
-            addr_hex
-                .bytes()
-                .zip(req.bytes())
-                .all(|(a, p)| p == b'.' || p == a)
-        }
-    }
-}
 
 fn parse_start_salt_u128(s: &str) -> u128 {
     let t = s.trim();
@@ -113,6 +222,9 @@ fn main() {
     // Normalize/validate pattern once
     let req = normalize_req(raw_req);
     validate_req(mode, &req);
+
+    // Parse pattern for fast byte-level matching
+    let parsed_pattern = ParsedPattern::from_hex_string(&req, mode);
 
     // --- Threading setup ---
     let default_threads = thread::available_parallelism()
@@ -149,7 +261,7 @@ fn main() {
     for i in 0..num_threads {
         let tx = tx.clone();
         let init_code_hash = Arc::clone(&init_code_hash);
-        let req = req.clone();
+        let pattern = parsed_pattern.clone();
 
         thread::spawn(move || {
             let progress_every = config::PROGRESS_EVERY;
@@ -163,7 +275,8 @@ fn main() {
 
                 let addr = create2_address_from_hash(deployer, salt_b256, &init_code_hash);
 
-                if address_matches(addr, &req, mode) {
+                // ⚡ OPTIMIZED: Zero-allocation byte-level matching
+                if address_matches_fast(&addr, &pattern) {
                     eprintln!(
                         "[FOUND] thread={} salt(dec)={} salt(hex)=0x{:064x} addr=0x{}",
                         i, j, j, hex::encode(addr)
