@@ -33,6 +33,27 @@ fn create2_address_from_hash(deployer: Address, salt: B256, init_code_hash: &[u8
     Address::from_slice(&hash[12..32])
 }
 
+/// Optimized CREATE2 computation with pre-allocated buffer (Phase 2 optimization)
+/// This avoids allocating the preimage buffer on every iteration
+#[inline(always)]
+fn create2_address_optimized(preimage: &mut [u8; 85], salt_bytes: &[u8; 32]) -> Address {
+    // Only update the salt portion (bytes 21..53), rest is pre-initialized
+    preimage[21..53].copy_from_slice(salt_bytes);
+
+    let hash = keccak256(preimage);
+    Address::from_slice(&hash[12..32])
+}
+
+/// Convert u128 salt directly to 32-byte array (B256 format)
+/// This eliminates the U256 intermediate conversion
+#[inline(always)]
+fn u128_to_b256_bytes(value: u128) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    // Place u128 in the last 16 bytes (big-endian)
+    bytes[16..32].copy_from_slice(&value.to_be_bytes());
+    bytes
+}
+
 fn normalize_req(s: &str) -> String {
     let mut p = s.trim().to_lowercase();
     if let Some(rest) = p.strip_prefix("0x") {
@@ -269,18 +290,28 @@ fn main() {
             // start from offset + thread index
             let mut j: u128 = start_at.wrapping_add(i as u128);
 
+            // ⚡ PHASE 2: Pre-allocate CREATE2 preimage buffer (reused every iteration)
+            let mut preimage = [0u8; 85];
+            preimage[0] = 0xff;
+            preimage[1..21].copy_from_slice(deployer.as_slice());
+            preimage[53..85].copy_from_slice(init_code_hash.as_slice());
+            // preimage[21..53] will be updated with salt each iteration
+
             loop {
-                let salt_u256 = U256::from(j);
-                let salt_b256 = B256::from(salt_u256);
+                // ⚡ PHASE 2: Direct u128 → [u8; 32] conversion (no U256 intermediate)
+                let salt_bytes = u128_to_b256_bytes(j);
 
-                let addr = create2_address_from_hash(deployer, salt_b256, &init_code_hash);
+                // ⚡ PHASE 2: Optimized CREATE2 with pre-allocated buffer
+                let addr = create2_address_optimized(&mut preimage, &salt_bytes);
 
-                // ⚡ OPTIMIZED: Zero-allocation byte-level matching
+                // ⚡ PHASE 1: Zero-allocation byte-level matching
                 if address_matches_fast(&addr, &pattern) {
                     eprintln!(
                         "[FOUND] thread={} salt(dec)={} salt(hex)=0x{:064x} addr=0x{}",
                         i, j, j, hex::encode(addr)
                     );
+                    // Convert back to U256 for display
+                    let salt_u256 = U256::from(j);
                     let _ = tx.send((salt_u256, addr));
                     break;
                 }
