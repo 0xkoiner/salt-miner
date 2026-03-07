@@ -1,0 +1,12 @@
+# ARM/Apple Silicon optimizations for M3 Pro
+[build]
+rustflags = [
+    "-C", "target-cpu=native",     # Enable CPU-specific instructions (ARM crypto, NEON)
+    "-C", "opt-level=3",            # Maximum optimization level
+]
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "opt-level=3",
+]

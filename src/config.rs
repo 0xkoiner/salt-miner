@@ -47,10 +47,13 @@ pub const MATCH_MODE: MatchMode = MatchMode::Prefix;
 ///   (Exact requires full 40 nibbles).
 /// - For Mask: provide a 40-char mask using [0-9a-f] and '.' wildcards,
 ///   e.g. "0x00007702................................"
-pub const REQUEST_PATTERN: &str = "0x00000000fee";
+pub const REQUEST_PATTERN: &str = "0x0000000000";
 
 /// Optional: set how many threads to use (None = use all logical CPUs).
-pub const THREAD_OVERRIDE: Option<usize> = Some(14);
+/// For Apple M3 Pro (12 physical cores: 6 P-cores + 6 E-cores):
+/// - Recommended: 12 threads (1 per physical core)
+/// - Test: 10, 11, 12, 14, 16 to find optimal for your workload
+pub const THREAD_OVERRIDE: Option<usize> = Some(12);
 
 /// Progress log interval per thread (every N salts checked).
 pub const PROGRESS_EVERY: u64 = 50_000;
